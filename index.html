@@ -1130,6 +1130,11 @@ var BOARD_ID     = '18402821844';
 var SOURCE_GROUP = 'group_mm16wch5';   // Basify and Flocc
 var DEST_GROUP   = 'group_mm163d9y';   // Filter-Press
 
+var VITAL_BOARD_ID = '18402880277';
+var SODIUM_HYDROXIDE_GROUP = 'group_mm17rn98';
+var SODA_ASH_GROUP = 'group_mm17ansz';
+var BAGS_COLUMN = 'numeric_mm17bhbw';
+
 var OPERATORS = {
   '4821': 'Josh',
   '0420': 'Q',
@@ -1236,6 +1241,19 @@ function updateBatchColumns(batchId, operatorName, dateStr, timeStr) {
   var escaped = colVals.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
   var mutation = 'mutation { change_multiple_column_values(board_id: ' + BOARD_ID + ', item_id: ' + batchId + ', column_values: "' + escaped + '") { id } }';
   return mondayQuery(mutation);
+}
+
+function deductVitalSupplies(batchName) {
+  var colVals = JSON.stringify({ "numeric_mm17bhbw": "-0.5" });
+  var escaped = colVals.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+
+  var sodiumMutation = 'mutation { create_item(board_id: ' + VITAL_BOARD_ID + ', group_id: "' + SODIUM_HYDROXIDE_GROUP + '", item_name: "' + batchName + '", column_values: "' + escaped + '") { id } }';
+  var sodaAshMutation = 'mutation { create_item(board_id: ' + VITAL_BOARD_ID + ', group_id: "' + SODA_ASH_GROUP + '", item_name: "' + batchName + '", column_values: "' + escaped + '") { id } }';
+
+  return Promise.all([
+    mondayQuery(sodiumMutation),
+    mondayQuery(sodaAshMutation)
+  ]);
 }
 
 /* ===========================
@@ -1517,7 +1535,8 @@ function executePush(dateStr, timeStr) {
 
   Promise.all([
     moveBatchToDest(batch.id),
-    updateBatchColumns(batch.id, state.currentOperator, dateStr, timeStr)
+    updateBatchColumns(batch.id, state.currentOperator, dateStr, timeStr),
+    deductVitalSupplies(batch.batchName || batch.name)
   ]).then(function() {
     state.sessionLogs.push({
       batchName: batch.batchName || batch.name,
@@ -1528,7 +1547,7 @@ function executePush(dateStr, timeStr) {
       duration:  duration
     });
 
-    showToast((batch.batchName || batch.name) + ' pushed to Filter-Press (' + duration + ')');
+    showToast((batch.batchName || batch.name) + ' pushed to Filter-Press — supplies deducted (' + duration + ')');
 
     // Reset running state
     state.runningBatch = null;
