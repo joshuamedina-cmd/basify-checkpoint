@@ -1,4 +1,5 @@
 <!DOCTYPE html>
+<!-- deploy v2 -->
 <html lang="en">
 <head>
 <!--
@@ -1158,670 +1159,448 @@ var OPERATORS = {
   '1234': 'Moh',
   '2691': 'Quentin',
   '8305': 'George T',
+  '4629': 'Frank',
   '0301': 'Jeremy'
 };
 
 /* ===========================
    STATE
    =========================== */
-var state = {
-  currentOperator: null,
-  currentCode: null,
-  roBatches: [],        // batches from RO storage (read-only reference)
-  createdBatchId: null, // Monday item ID of the new basify batch we created
-  createdBatchName: null,
-  runStartTime: null,
-  timerInterval: null,
-  sessionLogs: [],
-  pushing: false,
-  creating: false
-};
+var currentOperator = null;
+var roBatches = [];           // RO batches from Monday
+var activeBatch = null;       // The batch currently being basified
+var runStartTime = null;
+var timerInterval = null;
+var sessionLogs = [];
+var pendingLogEntry = null;
 
 /* ===========================
    MONDAY API
    =========================== */
-function mondayQuery(query) {
-  return fetch(MONDAY_API, {
+async function mondayQuery(query, vars) {
+  const res = await fetch(MONDAY_API, {
     method: 'POST',
     headers: {
-      'Authorization': MONDAY_TOKEN,
-      'Content-Type': 'application/json'
+      Authorization: MONDAY_TOKEN,
+      'Content-Type': 'application/json',
+      'API-Version': '2024-01'
     },
-    body: JSON.stringify({ query: query })
-  }).then(function(r) { return r.json(); });
+    body: JSON.stringify({ query, variables: vars })
+  });
+  const json = await res.json();
+  if (json.errors) throw new Error(json.errors[0].message);
+  return json.data;
 }
 
-/* ===========================
-   LOAD RO BATCHES (last 24h rolling)
-   =========================== */
-function loadBatches() {
-  setStatus('loading', 'Loading RO batches\u2026');
+async function loadBatches() {
+  setStatus('loading', 'Loading RO batches...');
+  try {
+    const data = await mondayQuery(`{
+      boards(ids: [${BOARD_ID}]) {
+        items_page(limit: 100, query_params: {
+          rules: [{ column_id: "group", compare_value: ["${RO_GROUP}"] }]
+        }) {
+          items {
+            id name
+            column_values { id text value }
+          }
+        }
+      }
+    }`);
+    const items = data.boards[0].items_page.items;
 
-  var query = '{ boards(ids: [' + BOARD_ID + ']) { items_page(limit: 200) { items { id name group { id title } column_values { id text value } } } } }';
+    const now = Date.now();
+    const cutoff = now - 24 * 60 * 60 * 1000; // 24h
 
-  return mondayQuery(query).then(function(result) {
-    var items = result.data.boards[0].items_page.items;
-    var roItems = items.filter(function(item) { return item.group.id === RO_GROUP; });
-
-    // Parse all RO items with their arrival timestamps
-    var allRO = roItems.map(function(item) {
-      var cols = {};
-      item.column_values.forEach(function(cv) { cols[cv.id] = cv.text; });
-      return {
-        id: item.id,
-        name: item.name,
-        batchName: cols['text_mm166879'] || item.name,
-        operator: cols['text_mm16pd4m'] || '',
-        date: cols['date4'] || '',
-        time: cols['text_mm1635'] || '',
-        roArrival: cols[RO_ARRIVAL_COL] || ''
-      };
-    });
-
-    // Find batches from the last 24 hours, expanding window if none found
-    var now = Date.now();
-    var windowHours = 24;
-    var found = [];
-
-    while (found.length === 0 && windowHours <= 24 * 30) {
-      var cutoff = now - (windowHours * 60 * 60 * 1000);
-      found = allRO.filter(function(b) {
-        if (!b.roArrival) return false;
-        var t = new Date(b.roArrival).getTime();
-        return !isNaN(t) && t >= cutoff;
+    roBatches = items
+      .map(item => {
+        const cols = {};
+        item.column_values.forEach(cv => { cols[cv.id] = cv; });
+        const arrivalText = cols[RO_ARRIVAL_COL]?.text || '';
+        const arrivalDate = arrivalText ? new Date(arrivalText) : null;
+        return {
+          id: item.id,
+          name: item.name,
+          arrival: arrivalDate,
+          arrivalText
+        };
+      })
+      .filter(b => !b.arrival || b.arrival.getTime() >= cutoff)
+      .sort((a, b) => {
+        if (!a.arrival && !b.arrival) return 0;
+        if (!a.arrival) return 1;
+        if (!b.arrival) return -1;
+        return a.arrival - b.arrival; // oldest first
       });
-      if (found.length === 0) windowHours += 24;
-    }
-
-    // If still none (no timestamps at all), include all RO batches
-    if (found.length === 0) found = allRO;
-
-    // Sort newest first
-    found.sort(function(a, b) {
-      var aT = a.roArrival ? new Date(a.roArrival).getTime() : 0;
-      var bT = b.roArrival ? new Date(b.roArrival).getTime() : 0;
-      return bT - aT;
-    });
-
-    state.roBatches = found;
 
     renderQueue();
     renderControl();
-    var count = state.roBatches.length;
+    setStatus('idle', `${roBatches.length} RO batch${roBatches.length !== 1 ? 'es' : ''} ready`);
+  } catch (err) {
+    console.error(err);
+    setStatus('error', 'Failed to load batches');
+  }
+}
 
-    if (state.createdBatchId) {
-      setStatus('running', 'Running: ' + state.createdBatchName);
-    } else {
-      var label = windowHours > 24
-        ? count + ' batch' + (count !== 1 ? 'es' : '') + ' (last ' + (windowHours / 24) + ' days)'
-        : count + ' batch' + (count !== 1 ? 'es' : '') + ' (last 24h)';
-      setStatus('idle', label);
-    }
+async function moveBatchToBasify(batchId) {
+  await mondayQuery(`mutation {
+    move_item_to_group(item_id: ${batchId}, group_id: "${BASIFY_GROUP}") { id }
+  }`);
+}
 
-    document.getElementById('queueCount').textContent = count + ' batch' + (count !== 1 ? 'es' : '');
-
-  }).catch(function(err) {
-    console.error('Load error:', err);
-    setStatus('error', 'Failed to load');
-  });
+async function moveBatchToDestGroup(batchId, startDateStr, startTimeStr, endDateStr, endTimeStr) {
+  // Move to Tank C group
+  await mondayQuery(`mutation {
+    move_item_to_group(item_id: ${batchId}, group_id: "${DEST_GROUP}") { id }
+  }`);
+  // Update columns (if column IDs are available) — placeholder for actual column updates
+  // column_values update can be added here
 }
 
 /* ===========================
-   MONDAY MUTATIONS
-   =========================== */
-function createBasifyBatch(batchName, operatorName) {
-  var colVals = JSON.stringify({
-    "text_mm166879": batchName,
-    "text_mm16pd4m": operatorName
-  });
-  var escaped = colVals.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-  var mutation = 'mutation { create_item(board_id: ' + BOARD_ID + ', group_id: "' + BASIFY_GROUP + '", item_name: "' + batchName.replace(/"/g, '\\"') + '", column_values: "' + escaped + '") { id } }';
-  return mondayQuery(mutation);
-}
-
-function createSubItem(parentItemId, subItemName) {
-  var mutation = 'mutation { create_subitem(parent_item_id: ' + parentItemId + ', item_name: "' + subItemName.replace(/"/g, '\\"') + '") { id } }';
-  return mondayQuery(mutation);
-}
-
-function moveBatchToDest(batchId) {
-  var mutation = 'mutation { move_item_to_group(item_id: ' + batchId + ', group_id: "' + DEST_GROUP + '") { id } }';
-  return mondayQuery(mutation);
-}
-
-function updateBatchColumns(batchId, operatorName, dateStr, timeStr) {
-  var colVals = JSON.stringify({
-    "text_mm16pd4m": operatorName,
-    "date4": dateStr,
-    "text_mm1635": timeStr
-  });
-  var escaped = colVals.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-  var mutation = 'mutation { change_multiple_column_values(board_id: ' + BOARD_ID + ', item_id: ' + batchId + ', column_values: "' + escaped + '") { id } }';
-  return mondayQuery(mutation);
-}
-
-function deductVitalSupplies(batchName) {
-  var colVals = JSON.stringify({ "numeric_mm17bhbw": "-0.5" });
-  var escaped = colVals.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-
-  var safeName = batchName.replace(/"/g, '\\"');
-  var sodiumMutation = 'mutation { create_item(board_id: ' + VITAL_BOARD_ID + ', group_id: "' + SODIUM_HYDROXIDE_GROUP + '", item_name: "' + safeName + '", column_values: "' + escaped + '") { id } }';
-  var sodaAshMutation = 'mutation { create_item(board_id: ' + VITAL_BOARD_ID + ', group_id: "' + SODA_ASH_GROUP + '", item_name: "' + safeName + '", column_values: "' + escaped + '") { id } }';
-
-  return Promise.all([
-    mondayQuery(sodiumMutation),
-    mondayQuery(sodaAshMutation)
-  ]);
-}
-
-/* ===========================
-   TIMER FUNCTIONS
-   =========================== */
-function startTimer() {
-  if (state.timerInterval) clearInterval(state.timerInterval);
-  state.timerInterval = setInterval(updateTimer, 1000);
-  updateTimer();
-}
-
-function stopTimer() {
-  if (state.timerInterval) { clearInterval(state.timerInterval); state.timerInterval = null; }
-}
-
-function updateTimer() {
-  var el = document.getElementById('timerValue');
-  if (!el || !state.runStartTime) return;
-  var elapsed = Math.floor((Date.now() - state.runStartTime.getTime()) / 1000);
-  var h = String(Math.floor(elapsed / 3600)).padStart(2, '0');
-  var m = String(Math.floor((elapsed % 3600) / 60)).padStart(2, '0');
-  var s = String(elapsed % 60).padStart(2, '0');
-  el.textContent = h + ':' + m + ':' + s;
-}
-
-/* ===========================
-   RENDERING
+   RENDER QUEUE
    =========================== */
 function renderQueue() {
-  var container = document.getElementById('queueContainer');
+  const container = document.getElementById('queueContainer');
+  const countEl = document.getElementById('queueCount');
+  countEl.textContent = `${roBatches.length} batch${roBatches.length !== 1 ? 'es' : ''}`;
 
-  if (state.roBatches.length === 0) {
-    container.innerHTML = '<div class="empty-state">No RO batches found</div>';
+  if (roBatches.length === 0) {
+    container.innerHTML = `<div class="empty-state">No RO batches in the last 24h</div>`;
     return;
   }
 
-  var html = '<ul class="queue-list">';
-  state.roBatches.forEach(function(batch, i) {
-    var meta = [];
-    if (batch.operator) meta.push(escapeHtml(batch.operator));
-    if (batch.roArrival) {
-      var d = new Date(batch.roArrival);
-      meta.push(formatDateShort(d) + ' ' + formatTime12h(d));
-    } else if (batch.date) {
-      meta.push(batch.date);
-    }
+  let html = '<ul class="queue-list">';
+  roBatches.forEach((batch, i) => {
+    const isActive = activeBatch && activeBatch.id === batch.id;
+    let cls = 'queue-item';
+    if (isActive) cls += ' running';
+    else if (i === 0 && !activeBatch) cls += ' next-up';
+    else cls += ' queued';
 
-    html +=
-      '<li class="queue-item">' +
-        '<span class="queue-num">' + (i + 1) + '</span>' +
-        '<div class="queue-info">' +
-          '<div class="queue-name">' + escapeHtml(batch.batchName) + '</div>' +
-          '<div class="queue-meta">' + (meta.length ? meta.join(' \u00b7 ') : 'No details') + '</div>' +
-        '</div>' +
-      '</li>';
+    html += `
+      <li class="${cls}" id="qi-${batch.id}">
+        <span class="queue-num">${i + 1}</span>
+        <div class="queue-info">
+          <div class="queue-name">${escHtml(batch.name)}</div>
+          <div class="queue-meta">${batch.arrivalText ? 'Arrived ' + formatShortDate(batch.arrival) : 'No arrival date'}</div>
+        </div>
+        ${isActive ? `<span class="queue-badge"><span class="live-dot"></span> Running</span>` : ''}
+      </li>`;
   });
   html += '</ul>';
   container.innerHTML = html;
 }
 
+/* ===========================
+   RENDER CONTROL
+   =========================== */
 function renderControl() {
-  var container = document.getElementById('controlContainer');
+  const c = document.getElementById('controlContainer');
 
-  // State: creating the new batch on Monday
-  if (state.creating) {
-    container.innerHTML =
-      '<div class="empty-state" style="padding:var(--space-4);">' +
-        '<div class="spinner" style="margin:0 auto var(--space-3);border-top-color:var(--accent);"></div>' +
-        'Creating basify batch on Monday.com\u2026' +
-      '</div>';
-    return;
-  }
-
-  // State: pushing to Tank C
-  if (state.pushing) {
-    container.innerHTML =
-      '<div class="empty-state" style="padding:var(--space-4);">' +
-        '<div class="spinner" style="margin:0 auto var(--space-3);border-top-color:var(--green);"></div>' +
-        'Moving batch to Tank C\u2026' +
-      '</div>';
-    return;
-  }
-
-  // State: basify timer is running
-  if (state.createdBatchId) {
-    container.innerHTML =
-      '<div class="timer-card">' +
-        '<div class="timer-label"><span class="live-dot"></span> Basify Running</div>' +
-        '<div class="timer-value" id="timerValue">00:00:00</div>' +
-        '<div class="timer-started">Started: ' + formatDateTime(state.runStartTime) + '</div>' +
-        '<div class="timer-batch-name">' + escapeHtml(state.createdBatchName) + '</div>' +
-        '<div style="font-size:var(--text-xs);color:#6a8aaa;margin-top:var(--space-2);">' + state.roBatches.length + ' RO batch' + (state.roBatches.length !== 1 ? 'es' : '') + ' included as sub-items</div>' +
-      '</div>' +
-      '<button class="btn btn-red btn-big" onclick="completeBasify()">' +
-        '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>' +
-        'Complete Basify' +
-      '</button>';
+  if (activeBatch) {
+    // RUNNING STATE
+    c.innerHTML = `
+      <div class="timer-card">
+        <div class="timer-label"><span class="live-dot"></span> Basify Running</div>
+        <div class="timer-value" id="timerValue">00:00:00</div>
+        <div class="timer-started">Started ${formatDateTime(runStartTime)}</div>
+        <div class="timer-batch-name">${escHtml(activeBatch.name)}</div>
+      </div>
+      <div style="text-align:center;">
+        <button class="btn btn-red btn-big" onclick="stopBasify()">STOP BASIFY</button>
+      </div>`;
     startTimer();
-    return;
-  }
 
-  // State: ready to create a new basify batch
-  if (state.roBatches.length > 0) {
-    container.innerHTML =
-      '<div class="push-area">' +
-        '<div class="push-batch-name">New Basify Batch</div>' +
-        '<div class="push-batch-meta">' + state.roBatches.length + ' RO batch' + (state.roBatches.length !== 1 ? 'es' : '') + ' will be included as sub-items</div>' +
-        '<div class="push-arrow">' +
-          'Basify &amp; Flocc' +
-          '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>' +
-          'Tank C' +
-        '</div>' +
-        '<button class="btn btn-green btn-big" onclick="startBasify()">' +
-          '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="5 3 19 12 5 21 5 3"/></svg>' +
-          'Create Batch &amp; Start Basify' +
-        '</button>' +
-      '</div>';
+  } else if (roBatches.length > 0) {
+    // IDLE — show next batch and start button
+    const next = roBatches[0];
+    c.innerHTML = `
+      <div class="push-area">
+        <div class="push-batch-name">${escHtml(next.name)}</div>
+        <div class="push-batch-meta">${next.arrivalText ? 'RO completed ' + formatShortDate(next.arrival) : 'Next up'}</div>
+        <div class="push-arrow">
+          <span>RO Storage</span>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+          <span>Basify &amp; Flocc</span>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+          <span>Tank C</span>
+        </div>
+        <button class="btn btn-green btn-big" onclick="startBasify()">START BASIFY</button>
+      </div>`;
+
   } else {
-    container.innerHTML = '<div class="empty-state" style="padding:var(--space-4);">No RO batches available to process</div>';
+    c.innerHTML = `<div class="empty-state">No RO batches available to basify</div>`;
   }
-}
-
-function renderLog() {
-  var container = document.getElementById('logContainer');
-
-  if (state.sessionLogs.length === 0) {
-    container.innerHTML = '<div class="empty-state" style="padding:var(--space-4);">No batches processed this session</div>';
-    return;
-  }
-
-  var html =
-    '<div class="log-table-wrapper">' +
-      '<table class="log-table">' +
-        '<thead><tr>' +
-          '<th>Batch</th><th>RO Batches</th><th>Duration</th><th>Status</th>' +
-        '</tr></thead>' +
-        '<tbody>';
-
-  state.sessionLogs.forEach(function(log) {
-    html +=
-      '<tr>' +
-        '<td><strong>' + escapeHtml(log.batchName) + '</strong></td>' +
-        '<td>' + log.subItemCount + ' sub-item' + (log.subItemCount !== 1 ? 's' : '') + '</td>' +
-        '<td>' + escapeHtml(log.duration) + '</td>' +
-        '<td><span class="badge-pushed">Tank C</span></td>' +
-      '</tr>';
-  });
-
-  html += '</tbody></table></div>';
-  container.innerHTML = html;
 }
 
 /* ===========================
-   BASIFY FLOW: CREATE NEW BATCH → TIMER → COMPLETE → PUSH TO TANK C
+   BASIFY ACTIONS
    =========================== */
 function startBasify() {
-  if (state.roBatches.length === 0 || state.createdBatchId) return;
-
-  var now = new Date();
-  var batchName = state.currentOperator + ' - ' + formatBatchTimestamp(now);
-
-  state.creating = true;
+  if (activeBatch || roBatches.length === 0) return;
+  activeBatch = roBatches[0];
+  runStartTime = new Date();
+  renderQueue();
   renderControl();
-  setStatus('loading', 'Creating batch\u2026');
-
-  // 1. Create the new batch item in Basify and Flocc group
-  createBasifyBatch(batchName, state.currentOperator).then(function(result) {
-    var newItemId = result.data.create_item.id;
-    state.createdBatchId   = newItemId;
-    state.createdBatchName = batchName;
-    state.runStartTime     = now;
-
-    // 2. Create sub-items for each RO batch (fire-and-forget, don't block the timer)
-    var subPromises = state.roBatches.map(function(roBatch) {
-      return createSubItem(newItemId, roBatch.batchName);
-    });
-
-    return Promise.all(subPromises);
-  }).then(function() {
-    state.creating = false;
-    renderControl();
-    renderQueue();
-    setStatus('running', 'Running: ' + state.createdBatchName);
-    showToast('Basify batch created: ' + state.createdBatchName + ' (' + state.roBatches.length + ' sub-items)');
-  }).catch(function(err) {
-    console.error('Create batch error:', err);
-    state.creating = false;
-    state.createdBatchId = null;
-    state.createdBatchName = null;
-    setStatus('error', 'Error creating batch');
-    renderControl();
-  });
+  setStatus('running', `Basifying: ${activeBatch.name}`);
+  showToast('Basify started: ' + activeBatch.name);
 }
 
-function completeBasify() {
-  if (!state.createdBatchId) return;
-
+function stopBasify() {
+  if (!activeBatch) return;
   stopTimer();
-
-  var stopTime = new Date();
-  var duration = formatDuration(state.runStartTime, stopTime);
-
-  // Show confirmation modal
-  var titleEl  = document.getElementById('modalTitle');
-  var subtitleEl = document.getElementById('modalSubtitle');
-  var bodyEl   = document.getElementById('modalBody');
-
-  titleEl.textContent   = 'Complete ' + state.createdBatchName + '?';
-  subtitleEl.textContent = 'Duration: ' + duration + ' \u2014 This batch will be moved to Tank C.';
-
-  bodyEl.innerHTML =
-    '<button class="btn btn-green" style="width:100%;min-height:56px;font-size:var(--text-base);" onclick="confirmComplete(\'now\')">' +
-      '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>' +
-      'Confirm &amp; Push to Tank C' +
-    '</button>' +
-    '<button class="btn btn-orange" style="width:100%;min-height:56px;font-size:var(--text-base);" onclick="confirmComplete(\'earlier\')">' +
-      '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>' +
-      'Happened Earlier' +
-    '</button>' +
-    '<button class="btn btn-secondary" style="width:100%;min-height:48px;" onclick="cancelComplete()">Cancel</button>';
-
-  document.getElementById('modal-confirm').classList.add('active');
+  const stopTime = new Date();
+  pendingLogEntry = {
+    batch: activeBatch,
+    startTime: runStartTime,
+    stopTime,
+    duration: formatDuration(runStartTime, stopTime),
+    pushed: false
+  };
+  openConfirmModal();
 }
 
-function confirmComplete(mode) {
-  if (mode === 'now') {
-    var now = new Date();
-    var dateStr = formatDateISO(now);
-    var timeStr = formatTime12h(now);
-    document.getElementById('modal-confirm').classList.remove('active');
-    executePush(dateStr, timeStr);
-  } else if (mode === 'earlier') {
-    showEarlierForm();
-  }
+function openConfirmModal() {
+  const overlay = document.getElementById('modal-confirm');
+  const title   = document.getElementById('modalTitle');
+  const sub     = document.getElementById('modalSubtitle');
+  const body    = document.getElementById('modalBody');
+
+  title.textContent = 'Complete Basify Run?';
+  sub.textContent   = `Batch: ${pendingLogEntry.batch.name} · Duration: ${pendingLogEntry.duration}`;
+
+  // Pre-fill date/time inputs with current values
+  const now = new Date();
+  const startD = fmtDateInput(pendingLogEntry.startTime);
+  const startT = fmtTimeInput(pendingLogEntry.startTime);
+  const endD   = fmtDateInput(now);
+  const endT   = fmtTimeInput(now);
+
+  body.innerHTML = `
+    <p style="font-size:var(--text-sm);color:var(--card-text-muted);">Review and adjust start/end times, then confirm to move the batch to Tank C.</p>
+    <div class="datetime-row">
+      <div>
+        <label>Start Date</label>
+        <input type="date" class="datetime-input" id="inp-start-date" value="${startD}">
+      </div>
+      <div>
+        <label>Start Time</label>
+        <input type="time" class="datetime-input" id="inp-start-time" value="${startT}">
+      </div>
+    </div>
+    <div class="datetime-row">
+      <div>
+        <label>End Date</label>
+        <input type="date" class="datetime-input" id="inp-end-date" value="${endD}">
+      </div>
+      <div>
+        <label>End Time</label>
+        <input type="time" class="datetime-input" id="inp-end-time" value="${endT}">
+      </div>
+    </div>
+    <button class="btn btn-green" style="width:100%;" onclick="confirmComplete()">Confirm &amp; Move to Tank C</button>
+    <button class="btn btn-secondary" style="width:100%;" onclick="closeModal()">Cancel</button>`;
+
+  overlay.classList.add('active');
 }
 
-function cancelComplete() {
-  document.getElementById('modal-confirm').classList.remove('active');
-  startTimer();
-}
+async function confirmComplete() {
+  const startDate = document.getElementById('inp-start-date').value;
+  const startTime = document.getElementById('inp-start-time').value;
+  const endDate   = document.getElementById('inp-end-date').value;
+  const endTime   = document.getElementById('inp-end-time').value;
 
-function showEarlierForm() {
-  var titleEl    = document.getElementById('modalTitle');
-  var subtitleEl = document.getElementById('modalSubtitle');
-  var bodyEl     = document.getElementById('modalBody');
+  closeModal();
+  setStatus('loading', 'Moving batch to Tank C...');
 
-  titleEl.textContent    = 'When did it happen?';
-  subtitleEl.textContent = 'Enter the date and time the batch was actually completed.';
-
-  var now = new Date();
-  var defaultDate = formatDateISO(now);
-  var defaultTime = formatTimeInput(now);
-
-  bodyEl.innerHTML =
-    '<div class="datetime-row">' +
-      '<div>' +
-        '<label for="input-date">Date</label>' +
-        '<input type="date" id="input-date" class="datetime-input" value="' + defaultDate + '">' +
-      '</div>' +
-      '<div>' +
-        '<label for="input-time">Time</label>' +
-        '<input type="time" id="input-time" class="datetime-input" value="' + defaultTime + '">' +
-      '</div>' +
-    '</div>' +
-    '<button class="btn btn-green" style="width:100%;min-height:56px;font-size:var(--text-base);" onclick="submitEarlier()">' +
-      '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>' +
-      'Confirm &amp; Push' +
-    '</button>' +
-    '<button class="btn btn-secondary" style="width:100%;min-height:48px;" onclick="cancelComplete()">Cancel</button>';
-}
-
-function submitEarlier() {
-  var dateInput = document.getElementById('input-date').value;
-  var timeInput = document.getElementById('input-time').value;
-
-  if (!dateInput || !timeInput) {
-    showToast('Please enter both date and time');
-    return;
+  try {
+    await moveBatchToBasify(pendingLogEntry.batch.id);
+    await moveBatchToDestGroup(pendingLogEntry.batch.id, startDate, startTime, endDate, endTime);
+    pendingLogEntry.pushed = true;
+    showToast(`${pendingLogEntry.batch.name} moved to Tank C`);
+  } catch (err) {
+    console.error(err);
+    showToast('Error moving batch. Check console.');
   }
 
-  var parts     = dateInput.split('-');
-  var timeParts = timeInput.split(':');
-  var entered   = new Date(
-    parseInt(parts[0]), parseInt(parts[1]) - 1, parseInt(parts[2]),
-    parseInt(timeParts[0]), parseInt(timeParts[1])
-  );
-
-  var dateStr = dateInput;
-  var timeStr = formatTime12h(entered);
-
-  document.getElementById('modal-confirm').classList.remove('active');
-  executePush(dateStr, timeStr);
-}
-
-function executePush(dateStr, timeStr) {
-  if (!state.createdBatchId) return;
-
-  var batchId   = state.createdBatchId;
-  var batchName = state.createdBatchName;
-  var duration  = formatDuration(state.runStartTime, new Date());
-  var subCount  = state.roBatches.length;
-
-  state.pushing = true;
-  setStatus('loading', 'Pushing ' + batchName + '\u2026');
-  renderControl();
-
-  Promise.all([
-    moveBatchToDest(batchId),
-    updateBatchColumns(batchId, state.currentOperator, dateStr, timeStr),
-    deductVitalSupplies(batchName)
-  ]).then(function() {
-    state.sessionLogs.push({
-      batchName:    batchName,
-      batchId:      batchId,
-      operator:     state.currentOperator,
-      date:         dateStr,
-      time:         timeStr,
-      duration:     duration,
-      subItemCount: subCount
-    });
-
-    showToast(batchName + ' pushed to Tank C \u2014 supplies deducted (' + duration + ')');
-
-    // Reset running state
-    state.createdBatchId   = null;
-    state.createdBatchName = null;
-    state.runStartTime     = null;
-    state.pushing          = false;
-
-    // Reload to show fresh RO batches
-    return loadBatches();
-  }).then(function() {
-    renderLog();
-  }).catch(function(err) {
-    console.error('Push error:', err);
-    state.pushing          = false;
-    state.createdBatchId   = null;
-    state.createdBatchName = null;
-    state.runStartTime     = null;
-    setStatus('error', 'Error pushing batch');
-    renderControl();
-  });
+  sessionLogs.unshift(pendingLogEntry);
+  pendingLogEntry = null;
+  activeBatch = null;
+  runStartTime = null;
+  await loadBatches();
+  renderLog();
 }
 
 function closeModal() {
   document.getElementById('modal-confirm').classList.remove('active');
+  if (!pendingLogEntry) return;
+  // If cancelled, restore state so user can restart
+  activeBatch = null;
+  runStartTime = null;
+  pendingLogEntry = null;
+  renderQueue();
+  renderControl();
+  setStatus('idle', `${roBatches.length} RO batch${roBatches.length !== 1 ? 'es' : ''} ready`);
+}
+
+/* ===========================
+   RENDER LOG
+   =========================== */
+function renderLog() {
+  const c = document.getElementById('logContainer');
+  if (sessionLogs.length === 0) {
+    c.innerHTML = `<div class="empty-state" style="padding:var(--space-4);">No batches processed this session</div>`;
+    return;
+  }
+
+  let html = `<div class="log-table-wrapper"><table class="log-table">
+    <thead><tr>
+      <th>Batch</th><th>Started</th><th>Duration</th><th>Moved</th>
+    </tr></thead><tbody>`;
+
+  sessionLogs.forEach(log => {
+    html += `<tr>
+      <td><strong>${escHtml(log.batch.name)}</strong></td>
+      <td>${formatTime(log.startTime)}</td>
+      <td>${log.duration}</td>
+      <td>${log.pushed ? '<span class="badge-pushed">Tank C</span>' : '—'}</td>
+    </tr>`;
+  });
+
+  html += '</tbody></table></div>';
+  c.innerHTML = html;
+}
+
+/* ===========================
+   TIMER
+   =========================== */
+function startTimer() {
+  if (timerInterval) clearInterval(timerInterval);
+  timerInterval = setInterval(updateTimer, 1000);
+  updateTimer();
+}
+
+function stopTimer() {
+  clearInterval(timerInterval);
+  timerInterval = null;
+}
+
+function updateTimer() {
+  const el = document.getElementById('timerValue');
+  if (!el || !runStartTime) return;
+  const s = Math.floor((Date.now() - runStartTime) / 1000);
+  el.textContent = fmt2(Math.floor(s/3600)) + ':' + fmt2(Math.floor((s%3600)/60)) + ':' + fmt2(s%60);
 }
 
 /* ===========================
    AUTH
    =========================== */
 function handleLogin() {
-  var input   = document.getElementById('operator-code');
-  var errorEl = document.getElementById('login-error');
-  var code    = input.value.trim();
-
+  const code = document.getElementById('operator-code').value.trim().toUpperCase();
   if (OPERATORS[code]) {
-    errorEl.classList.remove('visible');
-    state.currentOperator = OPERATORS[code];
-    state.currentCode     = code;
-
-    document.getElementById('operatorNameDisplay').textContent = state.currentOperator;
-    document.getElementById('operatorInitials').textContent    = getInitials(state.currentOperator);
-
-    showScreen('screen-main');
+    currentOperator = OPERATORS[code];
+    const initials = currentOperator.split(' ').map(w => w[0]).join('').slice(0,2).toUpperCase();
+    document.getElementById('operatorInitials').textContent = initials;
+    document.getElementById('operatorNameDisplay').textContent = currentOperator;
+    document.getElementById('screen-login').classList.remove('active');
+    document.getElementById('screen-main').classList.add('active');
+    showToast('Welcome, ' + currentOperator + '!');
     loadBatches();
-    input.value = '';
   } else {
-    errorEl.classList.remove('visible');
-    void errorEl.offsetWidth;
-    errorEl.classList.add('visible');
-    input.value = '';
-    input.focus();
+    const err = document.getElementById('login-error');
+    err.classList.add('visible');
+    setTimeout(() => err.classList.remove('visible'), 2500);
+    document.getElementById('operator-code').value = '';
   }
 }
 
-function handleLogout() {
+function logout() {
   stopTimer();
-
-  state.currentOperator  = null;
-  state.currentCode      = null;
-  state.roBatches        = [];
-  state.createdBatchId   = null;
-  state.createdBatchName = null;
-  state.runStartTime     = null;
-  state.sessionLogs      = [];
-  state.pushing          = false;
-  state.creating         = false;
-  showScreen('screen-login');
-  document.getElementById('operator-code').focus();
+  currentOperator = null;
+  activeBatch = null;
+  runStartTime = null;
+  roBatches = [];
+  sessionLogs = [];
+  document.getElementById('screen-main').classList.remove('active');
+  document.getElementById('screen-login').classList.add('active');
+  document.getElementById('operator-code').value = '';
 }
 
 /* ===========================
    HELPERS
    =========================== */
-function showScreen(id) {
-  var screens = document.querySelectorAll('.screen');
-  for (var i = 0; i < screens.length; i++) screens[i].classList.remove('active');
-  document.getElementById(id).classList.add('active');
-}
-
 function setStatus(type, msg) {
-  var pill = document.getElementById('statusPill');
-  pill.className = 'status-pill ' + type;
-  if (type === 'loading') {
-    pill.innerHTML = '<span class="spinner" style="width:12px;height:12px;border-width:1.5px;border-top-color:var(--orange-dark);"></span><span>' + msg + '</span>';
-  } else {
-    pill.innerHTML = '<span>' + msg + '</span>';
-  }
+  const pill = document.getElementById('statusPill');
+  const txt  = document.getElementById('statusText');
+  pill.className = `status-pill ${type}`;
+  txt.innerHTML = type === 'loading' ? `<span class="spinner" style="width:12px;height:12px;border-width:1.5px;"></span> ${msg}` : msg;
 }
 
 function showToast(msg) {
-  var toast = document.getElementById('toast');
-  toast.textContent = msg;
-  toast.classList.add('visible');
-  setTimeout(function() { toast.classList.remove('visible'); }, 2600);
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('visible');
+  setTimeout(() => t.classList.remove('visible'), 3000);
 }
 
-function getInitials(name) {
-  return name.split(' ').map(function(p) { return p[0]; }).join('');
+function formatDateTime(d) {
+  if (!d) return '';
+  return d.toLocaleDateString('en-US', {month:'short',day:'numeric'}) + ' ' +
+    d.toLocaleTimeString('en-US', {hour:'numeric',minute:'2-digit',second:'2-digit',hour12:true});
 }
 
-function formatBatchTimestamp(date) {
-  var mo  = String(date.getMonth() + 1).padStart(2, '0');
-  var day = String(date.getDate()).padStart(2, '0');
-  var yr  = date.getFullYear();
-  var h   = date.getHours();
-  var m   = date.getMinutes();
-  var ampm = h >= 12 ? 'PM' : 'AM';
-  h = h % 12;
-  if (h === 0) h = 12;
-  return mo + '/' + day + '/' + yr + ' ' + h + ':' + (m < 10 ? '0' : '') + m + ampm;
+function formatShortDate(d) {
+  if (!d) return '';
+  return d.toLocaleDateString('en-US', {month:'short',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true});
 }
 
-function formatDateISO(date) {
-  var y = date.getFullYear();
-  var m = String(date.getMonth() + 1).padStart(2, '0');
-  var d = String(date.getDate()).padStart(2, '0');
-  return y + '-' + m + '-' + d;
+function formatTime(d) {
+  if (!d) return '';
+  return d.toLocaleTimeString('en-US', {hour:'numeric',minute:'2-digit',hour12:true});
 }
 
-function formatDateShort(d) {
-  var months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-  return months[d.getMonth()] + ' ' + d.getDate();
+function formatDuration(s, e) {
+  const sec = Math.floor((e - s) / 1000);
+  const h = Math.floor(sec/3600), m = Math.floor((sec%3600)/60), ss = sec%60;
+  if (h > 0) return `${h}h ${m}m ${ss}s`;
+  if (m > 0) return `${m}m ${ss}s`;
+  return `${ss}s`;
 }
 
-function formatTimeInput(date) {
-  var h = String(date.getHours()).padStart(2, '0');
-  var m = String(date.getMinutes()).padStart(2, '0');
-  return h + ':' + m;
+function fmt2(n) { return String(n).padStart(2,'0'); }
+
+function fmtDateInput(d) {
+  return d.getFullYear() + '-' + fmt2(d.getMonth()+1) + '-' + fmt2(d.getDate());
 }
 
-function formatTime12h(date) {
-  var h    = date.getHours();
-  var m    = date.getMinutes();
-  var ampm = h >= 12 ? 'PM' : 'AM';
-  h = h % 12;
-  if (h === 0) h = 12;
-  return h + ':' + (m < 10 ? '0' : '') + m + ' ' + ampm;
+function fmtTimeInput(d) {
+  return fmt2(d.getHours()) + ':' + fmt2(d.getMinutes());
 }
 
-function formatDateTime(date) {
-  if (!date) return '';
-  var h = date.getHours(); var m = date.getMinutes(); var s = date.getSeconds();
-  var ampm = h >= 12 ? 'PM' : 'AM';
-  h = h % 12; if (h === 0) h = 12;
-  var months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-  return months[date.getMonth()] + ' ' + date.getDate() + ', ' +
-    h + ':' + (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s + ' ' + ampm;
-}
-
-function formatDuration(start, end) {
-  var elapsed = Math.floor((end - start) / 1000);
-  var h = Math.floor(elapsed / 3600);
-  var m = Math.floor((elapsed % 3600) / 60);
-  var s = elapsed % 60;
-  if (h > 0) return h + 'h ' + m + 'm ' + s + 's';
-  if (m > 0) return m + 'm ' + s + 's';
-  return s + 's';
-}
-
-function escapeHtml(str) {
-  if (!str) return '';
-  var div = document.createElement('div');
-  div.textContent = str;
-  return div.innerHTML;
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
 /* ===========================
-   EVENT LISTENERS
+   INIT
    =========================== */
 document.getElementById('login-btn').addEventListener('click', handleLogin);
-
 document.getElementById('operator-code').addEventListener('keydown', function(e) {
   if (e.key === 'Enter') handleLogin();
 });
-
-// Auto-login on 4 chars
-document.getElementById('operator-code').addEventListener('input', function() {
-  if (this.value.length === 4) handleLogin();
+document.getElementById('operator-code').addEventListener('input', function(e) {
+  if (e.target.value.length === 4) handleLogin();
 });
-
-document.getElementById('logout-btn').addEventListener('click', handleLogout);
+document.getElementById('logout-btn').addEventListener('click', logout);
 
 document.getElementById('modal-confirm').addEventListener('click', function(e) {
   if (e.target === this) closeModal();
 });
 
-// Focus input on load
+// Focus code input on load
 document.getElementById('operator-code').focus();
 </script>
+
 </body>
 </html>
