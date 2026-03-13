@@ -996,7 +996,7 @@ a, button, input, textarea, select {
         <path d="M10 42 Q26 38 42 42" stroke="#1565C0" stroke-width="1" opacity="0.25" fill="none"/>
       </svg>
       <h1>Basify Checkpoint</h1>
-      <p>Basify &amp; Flocc &rarr; Filter-Press</p>
+      <p>Basify &amp; Flocc &rarr; Tank C</p>
     </div>
 
     <div class="card">
@@ -1043,7 +1043,7 @@ a, button, input, textarea, select {
         </svg>
         <h1 style="margin:0;">Basify Checkpoint</h1>
       </div>
-      <p>Basify &amp; Flocc &rarr; Filter-Press</p>
+      <p>Basify &amp; Flocc &rarr; Tank C</p>
     </div>
 
     <!-- Status + controls row -->
@@ -1067,21 +1067,21 @@ a, button, input, textarea, select {
 
       <div class="card-body">
 
-        <!-- Queue -->
+        <!-- RO Batches available -->
         <div class="queue-header">
-          <span class="queue-title">Basify &amp; Flocc Queue</span>
+          <span class="queue-title">RO Batches (Last 24h)</span>
           <span class="queue-count" id="queueCount">0 batches</span>
         </div>
         <div id="queueContainer">
           <div class="empty-state">
             <div class="spinner" style="margin:0 auto var(--space-3);"></div>
-            Loading batches from Monday.com&hellip;
+            Loading RO batches&hellip;
           </div>
         </div>
 
         <div class="divider"></div>
 
-        <!-- Control Area (Timer + Start/Complete) -->
+        <!-- Control Area (Create Batch + Timer + Complete) -->
         <div class="section-title">Basify Process</div>
         <div id="controlContainer">
           <!-- Dynamic -->
@@ -1127,8 +1127,10 @@ a, button, input, textarea, select {
 var MONDAY_API   = 'https://api.monday.com/v2';
 var MONDAY_TOKEN = 'eyJhbGciOiJIUzI1NiJ9.eyJ0aWQiOjYyNzA3NzcxOSwiYWFpIjoxMSwidWlkIjo3NTA2NTY3OCwiaWFkIjoiMjAyNi0wMi0yOFQwMToxNzowOS4wMDBaIiwicGVyIjoibWU6d3JpdGUiLCJhY3RpZCI6MjkxNDg2NzMsInJnbiI6InVzZTEifQ.ocD9w0Q-17JqNfU4iZXL4i3frn_Bw4pyVe_fkhJuiPg';
 var BOARD_ID     = '18402821844';
-var SOURCE_GROUP = 'group_mm16wch5';   // Basify and Flocc
-var DEST_GROUP   = 'group_mm163d9y';   // Filter-Press
+var RO_GROUP     = 'group_mm16ennm';   // Pre-RO system (permanent storage)
+var BASIFY_GROUP = 'group_mm16wch5';   // Basify and Flocc
+var DEST_GROUP   = 'group_mm163d9y';   // Tank C
+var RO_ARRIVAL_COL = 'text_mm1db43';   // "RO Completed" column — arrival timestamp
 
 var VITAL_BOARD_ID = '18402880277';
 var SODIUM_HYDROXIDE_GROUP = 'group_mm17rn98';
@@ -1164,12 +1166,14 @@ var OPERATORS = {
 var state = {
   currentOperator: null,
   currentCode: null,
-  batches: [],
-  runningBatch: null,
+  roBatches: [],        // batches from RO storage (read-only reference)
+  createdBatchId: null, // Monday item ID of the new basify batch we created
+  createdBatchName: null,
   runStartTime: null,
   timerInterval: null,
   sessionLogs: [],
-  pushing: false
+  pushing: false,
+  creating: false
 };
 
 /* ===========================
@@ -1186,16 +1190,20 @@ function mondayQuery(query) {
   }).then(function(r) { return r.json(); });
 }
 
+/* ===========================
+   LOAD RO BATCHES (last 24h rolling)
+   =========================== */
 function loadBatches() {
-  setStatus('loading', 'Loading\u2026');
+  setStatus('loading', 'Loading RO batches\u2026');
 
-  var query = '{ boards(ids: [' + BOARD_ID + ']) { items_page(limit: 100) { items { id name group { id title } column_values { id text value } } } } }';
+  var query = '{ boards(ids: [' + BOARD_ID + ']) { items_page(limit: 200) { items { id name group { id title } column_values { id text value } } } } }';
 
   return mondayQuery(query).then(function(result) {
     var items = result.data.boards[0].items_page.items;
-    var sourceItems = items.filter(function(item) { return item.group.id === SOURCE_GROUP; });
+    var roItems = items.filter(function(item) { return item.group.id === RO_GROUP; });
 
-    state.batches = sourceItems.map(function(item, i) {
+    // Parse all RO items with their arrival timestamps
+    var allRO = roItems.map(function(item) {
       var cols = {};
       item.column_values.forEach(function(cv) { cols[cv.id] = cv.text; });
       return {
@@ -1205,18 +1213,48 @@ function loadBatches() {
         operator: cols['text_mm16pd4m'] || '',
         date: cols['date4'] || '',
         time: cols['text_mm1635'] || '',
-        position: i + 1
+        roArrival: cols[RO_ARRIVAL_COL] || ''
       };
     });
 
+    // Find batches from the last 24 hours, expanding window if none found
+    var now = Date.now();
+    var windowHours = 24;
+    var found = [];
+
+    while (found.length === 0 && windowHours <= 24 * 30) {
+      var cutoff = now - (windowHours * 60 * 60 * 1000);
+      found = allRO.filter(function(b) {
+        if (!b.roArrival) return false;
+        var t = new Date(b.roArrival).getTime();
+        return !isNaN(t) && t >= cutoff;
+      });
+      if (found.length === 0) windowHours += 24;
+    }
+
+    // If still none (no timestamps at all), include all RO batches
+    if (found.length === 0) found = allRO;
+
+    // Sort newest first
+    found.sort(function(a, b) {
+      var aT = a.roArrival ? new Date(a.roArrival).getTime() : 0;
+      var bT = b.roArrival ? new Date(b.roArrival).getTime() : 0;
+      return bT - aT;
+    });
+
+    state.roBatches = found;
+
     renderQueue();
     renderControl();
-    var count = state.batches.length;
+    var count = state.roBatches.length;
 
-    if (state.runningBatch) {
-      setStatus('running', 'Running: ' + (state.runningBatch.batchName || state.runningBatch.name));
+    if (state.createdBatchId) {
+      setStatus('running', 'Running: ' + state.createdBatchName);
     } else {
-      setStatus('idle', count + ' batch' + (count !== 1 ? 'es' : '') + ' in queue');
+      var label = windowHours > 24
+        ? count + ' batch' + (count !== 1 ? 'es' : '') + ' (last ' + (windowHours / 24) + ' days)'
+        : count + ' batch' + (count !== 1 ? 'es' : '') + ' (last 24h)';
+      setStatus('idle', label);
     }
 
     document.getElementById('queueCount').textContent = count + ' batch' + (count !== 1 ? 'es' : '');
@@ -1225,6 +1263,24 @@ function loadBatches() {
     console.error('Load error:', err);
     setStatus('error', 'Failed to load');
   });
+}
+
+/* ===========================
+   MONDAY MUTATIONS
+   =========================== */
+function createBasifyBatch(batchName, operatorName) {
+  var colVals = JSON.stringify({
+    "text_mm166879": batchName,
+    "text_mm16pd4m": operatorName
+  });
+  var escaped = colVals.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  var mutation = 'mutation { create_item(board_id: ' + BOARD_ID + ', group_id: "' + BASIFY_GROUP + '", item_name: "' + batchName.replace(/"/g, '\\"') + '", column_values: "' + escaped + '") { id } }';
+  return mondayQuery(mutation);
+}
+
+function createSubItem(parentItemId, subItemName) {
+  var mutation = 'mutation { create_subitem(parent_item_id: ' + parentItemId + ', item_name: "' + subItemName.replace(/"/g, '\\"') + '") { id } }';
+  return mondayQuery(mutation);
 }
 
 function moveBatchToDest(batchId) {
@@ -1247,8 +1303,9 @@ function deductVitalSupplies(batchName) {
   var colVals = JSON.stringify({ "numeric_mm17bhbw": "-0.5" });
   var escaped = colVals.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 
-  var sodiumMutation = 'mutation { create_item(board_id: ' + VITAL_BOARD_ID + ', group_id: "' + SODIUM_HYDROXIDE_GROUP + '", item_name: "' + batchName + '", column_values: "' + escaped + '") { id } }';
-  var sodaAshMutation = 'mutation { create_item(board_id: ' + VITAL_BOARD_ID + ', group_id: "' + SODA_ASH_GROUP + '", item_name: "' + batchName + '", column_values: "' + escaped + '") { id } }';
+  var safeName = batchName.replace(/"/g, '\\"');
+  var sodiumMutation = 'mutation { create_item(board_id: ' + VITAL_BOARD_ID + ', group_id: "' + SODIUM_HYDROXIDE_GROUP + '", item_name: "' + safeName + '", column_values: "' + escaped + '") { id } }';
+  var sodaAshMutation = 'mutation { create_item(board_id: ' + VITAL_BOARD_ID + ', group_id: "' + SODA_ASH_GROUP + '", item_name: "' + safeName + '", column_values: "' + escaped + '") { id } }';
 
   return Promise.all([
     mondayQuery(sodiumMutation),
@@ -1285,36 +1342,29 @@ function updateTimer() {
 function renderQueue() {
   var container = document.getElementById('queueContainer');
 
-  if (state.batches.length === 0) {
-    container.innerHTML = '<div class="empty-state">No batches in Basify &amp; Flocc queue</div>';
+  if (state.roBatches.length === 0) {
+    container.innerHTML = '<div class="empty-state">No RO batches found</div>';
     return;
   }
 
   var html = '<ul class="queue-list">';
-  state.batches.forEach(function(batch, i) {
-    var isRunning = state.runningBatch && state.runningBatch.id === batch.id;
-    var isNext = !state.runningBatch && i === 0;
-    var cls = isRunning ? 'queue-item running' : (isNext ? 'queue-item next-up' : 'queue-item queued');
+  state.roBatches.forEach(function(batch, i) {
     var meta = [];
     if (batch.operator) meta.push(escapeHtml(batch.operator));
-    if (batch.date) meta.push(batch.date);
-    if (batch.time) meta.push(batch.time);
-
-    var badgeHtml = '';
-    if (isRunning) {
-      badgeHtml = '<div class="queue-badge"><span class="live-dot"></span> Running</div>';
-    } else if (isNext) {
-      badgeHtml = '<div class="queue-badge"><span class="live-dot"></span> Next</div>';
+    if (batch.roArrival) {
+      var d = new Date(batch.roArrival);
+      meta.push(formatDateShort(d) + ' ' + formatTime12h(d));
+    } else if (batch.date) {
+      meta.push(batch.date);
     }
 
     html +=
-      '<li class="' + cls + '">' +
+      '<li class="queue-item">' +
         '<span class="queue-num">' + (i + 1) + '</span>' +
         '<div class="queue-info">' +
-          '<div class="queue-name">' + escapeHtml(batch.batchName || batch.name) + '</div>' +
+          '<div class="queue-name">' + escapeHtml(batch.batchName) + '</div>' +
           '<div class="queue-meta">' + (meta.length ? meta.join(' \u00b7 ') : 'No details') + '</div>' +
         '</div>' +
-        badgeHtml +
       '</li>';
   });
   html += '</ul>';
@@ -1324,24 +1374,35 @@ function renderQueue() {
 function renderControl() {
   var container = document.getElementById('controlContainer');
 
-  // State: currently pushing (moving batch)
-  if (state.pushing) {
+  // State: creating the new batch on Monday
+  if (state.creating) {
     container.innerHTML =
       '<div class="empty-state" style="padding:var(--space-4);">' +
-        '<div class="spinner" style="margin:0 auto var(--space-3);border-top-color:var(--green);"></div>' +
-        'Moving batch to Filter-Press\u2026' +
+        '<div class="spinner" style="margin:0 auto var(--space-3);border-top-color:var(--accent);"></div>' +
+        'Creating basify batch on Monday.com\u2026' +
       '</div>';
     return;
   }
 
-  // State: timer is running
-  if (state.runningBatch) {
+  // State: pushing to Tank C
+  if (state.pushing) {
+    container.innerHTML =
+      '<div class="empty-state" style="padding:var(--space-4);">' +
+        '<div class="spinner" style="margin:0 auto var(--space-3);border-top-color:var(--green);"></div>' +
+        'Moving batch to Tank C\u2026' +
+      '</div>';
+    return;
+  }
+
+  // State: basify timer is running
+  if (state.createdBatchId) {
     container.innerHTML =
       '<div class="timer-card">' +
         '<div class="timer-label"><span class="live-dot"></span> Basify Running</div>' +
         '<div class="timer-value" id="timerValue">00:00:00</div>' +
         '<div class="timer-started">Started: ' + formatDateTime(state.runStartTime) + '</div>' +
-        '<div class="timer-batch-name">' + escapeHtml(state.runningBatch.batchName || state.runningBatch.name) + '</div>' +
+        '<div class="timer-batch-name">' + escapeHtml(state.createdBatchName) + '</div>' +
+        '<div style="font-size:var(--text-xs);color:#6a8aaa;margin-top:var(--space-2);">' + state.roBatches.length + ' RO batch' + (state.roBatches.length !== 1 ? 'es' : '') + ' included as sub-items</div>' +
       '</div>' +
       '<button class="btn btn-red btn-big" onclick="completeBasify()">' +
         '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>' +
@@ -1351,25 +1412,24 @@ function renderControl() {
     return;
   }
 
-  // State: batches available, ready to start
-  if (state.batches.length > 0) {
-    var next = state.batches[0];
+  // State: ready to create a new basify batch
+  if (state.roBatches.length > 0) {
     container.innerHTML =
       '<div class="push-area">' +
-        '<div class="push-batch-name">' + escapeHtml(next.batchName || next.name) + '</div>' +
-        '<div class="push-batch-meta">Next in queue \u00b7 Position #1</div>' +
+        '<div class="push-batch-name">New Basify Batch</div>' +
+        '<div class="push-batch-meta">' + state.roBatches.length + ' RO batch' + (state.roBatches.length !== 1 ? 'es' : '') + ' will be included as sub-items</div>' +
         '<div class="push-arrow">' +
           'Basify &amp; Flocc' +
           '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>' +
-          'Filter-Press' +
+          'Tank C' +
         '</div>' +
         '<button class="btn btn-green btn-big" onclick="startBasify()">' +
           '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="5 3 19 12 5 21 5 3"/></svg>' +
-          'Start Basify' +
+          'Create Batch &amp; Start Basify' +
         '</button>' +
       '</div>';
   } else {
-    container.innerHTML = '<div class="empty-state" style="padding:var(--space-4);">No batches available to process</div>';
+    container.innerHTML = '<div class="empty-state" style="padding:var(--space-4);">No RO batches available to process</div>';
   }
 }
 
@@ -1385,7 +1445,7 @@ function renderLog() {
     '<div class="log-table-wrapper">' +
       '<table class="log-table">' +
         '<thead><tr>' +
-          '<th>Batch</th><th>Date</th><th>Time</th><th>Duration</th><th>Status</th>' +
+          '<th>Batch</th><th>RO Batches</th><th>Duration</th><th>Status</th>' +
         '</tr></thead>' +
         '<tbody>';
 
@@ -1393,10 +1453,9 @@ function renderLog() {
     html +=
       '<tr>' +
         '<td><strong>' + escapeHtml(log.batchName) + '</strong></td>' +
-        '<td>' + escapeHtml(log.date) + '</td>' +
-        '<td>' + escapeHtml(log.time) + '</td>' +
+        '<td>' + log.subItemCount + ' sub-item' + (log.subItemCount !== 1 ? 's' : '') + '</td>' +
         '<td>' + escapeHtml(log.duration) + '</td>' +
-        '<td><span class="badge-pushed">Pushed</span></td>' +
+        '<td><span class="badge-pushed">Tank C</span></td>' +
       '</tr>';
   });
 
@@ -1405,43 +1464,67 @@ function renderLog() {
 }
 
 /* ===========================
-   BASIFY FLOW: START → TIMER → COMPLETE → PUSH ONE BATCH
+   BASIFY FLOW: CREATE NEW BATCH → TIMER → COMPLETE → PUSH TO TANK C
    =========================== */
 function startBasify() {
-  if (state.batches.length === 0 || state.runningBatch) return;
+  if (state.roBatches.length === 0 || state.createdBatchId) return;
 
-  state.runningBatch = state.batches[0];
-  state.runStartTime = new Date();
+  var now = new Date();
+  var batchName = state.currentOperator + ' - ' + formatBatchTimestamp(now);
 
-  renderQueue();
+  state.creating = true;
   renderControl();
-  setStatus('running', 'Running: ' + (state.runningBatch.batchName || state.runningBatch.name));
-  showToast('Basify started: ' + (state.runningBatch.batchName || state.runningBatch.name));
+  setStatus('loading', 'Creating batch\u2026');
+
+  // 1. Create the new batch item in Basify and Flocc group
+  createBasifyBatch(batchName, state.currentOperator).then(function(result) {
+    var newItemId = result.data.create_item.id;
+    state.createdBatchId   = newItemId;
+    state.createdBatchName = batchName;
+    state.runStartTime     = now;
+
+    // 2. Create sub-items for each RO batch (fire-and-forget, don't block the timer)
+    var subPromises = state.roBatches.map(function(roBatch) {
+      return createSubItem(newItemId, roBatch.batchName);
+    });
+
+    return Promise.all(subPromises);
+  }).then(function() {
+    state.creating = false;
+    renderControl();
+    renderQueue();
+    setStatus('running', 'Running: ' + state.createdBatchName);
+    showToast('Basify batch created: ' + state.createdBatchName + ' (' + state.roBatches.length + ' sub-items)');
+  }).catch(function(err) {
+    console.error('Create batch error:', err);
+    state.creating = false;
+    state.createdBatchId = null;
+    state.createdBatchName = null;
+    setStatus('error', 'Error creating batch');
+    renderControl();
+  });
 }
 
 function completeBasify() {
-  if (!state.runningBatch) return;
+  if (!state.createdBatchId) return;
 
   stopTimer();
 
   var stopTime = new Date();
   var duration = formatDuration(state.runStartTime, stopTime);
-  var batch = state.runningBatch;
-  var dateStr = formatDateISO(stopTime);
-  var timeStr = formatTime12h(stopTime);
 
   // Show confirmation modal
   var titleEl  = document.getElementById('modalTitle');
   var subtitleEl = document.getElementById('modalSubtitle');
   var bodyEl   = document.getElementById('modalBody');
 
-  titleEl.textContent   = 'Complete ' + (batch.batchName || batch.name) + '?';
-  subtitleEl.textContent = 'Duration: ' + duration + ' \u2014 This batch will be moved to Filter-Press.';
+  titleEl.textContent   = 'Complete ' + state.createdBatchName + '?';
+  subtitleEl.textContent = 'Duration: ' + duration + ' \u2014 This batch will be moved to Tank C.';
 
   bodyEl.innerHTML =
     '<button class="btn btn-green" style="width:100%;min-height:56px;font-size:var(--text-base);" onclick="confirmComplete(\'now\')">' +
       '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>' +
-      'Confirm &amp; Push Now' +
+      'Confirm &amp; Push to Tank C' +
     '</button>' +
     '<button class="btn btn-orange" style="width:100%;min-height:56px;font-size:var(--text-base);" onclick="confirmComplete(\'earlier\')">' +
       '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>' +
@@ -1465,7 +1548,6 @@ function confirmComplete(mode) {
 }
 
 function cancelComplete() {
-  // Resume the timer since they cancelled
   document.getElementById('modal-confirm').classList.remove('active');
   startTimer();
 }
@@ -1524,45 +1606,50 @@ function submitEarlier() {
 }
 
 function executePush(dateStr, timeStr) {
-  if (!state.runningBatch) return;
+  if (!state.createdBatchId) return;
 
-  var batch = state.runningBatch;
-  var duration = formatDuration(state.runStartTime, new Date());
+  var batchId   = state.createdBatchId;
+  var batchName = state.createdBatchName;
+  var duration  = formatDuration(state.runStartTime, new Date());
+  var subCount  = state.roBatches.length;
 
   state.pushing = true;
-  setStatus('loading', 'Pushing ' + (batch.batchName || batch.name) + '\u2026');
+  setStatus('loading', 'Pushing ' + batchName + '\u2026');
   renderControl();
 
   Promise.all([
-    moveBatchToDest(batch.id),
-    updateBatchColumns(batch.id, state.currentOperator, dateStr, timeStr),
-    deductVitalSupplies(batch.batchName || batch.name)
+    moveBatchToDest(batchId),
+    updateBatchColumns(batchId, state.currentOperator, dateStr, timeStr),
+    deductVitalSupplies(batchName)
   ]).then(function() {
     state.sessionLogs.push({
-      batchName: batch.batchName || batch.name,
-      batchId:   batch.id,
-      operator:  state.currentOperator,
-      date:      dateStr,
-      time:      timeStr,
-      duration:  duration
+      batchName:    batchName,
+      batchId:      batchId,
+      operator:     state.currentOperator,
+      date:         dateStr,
+      time:         timeStr,
+      duration:     duration,
+      subItemCount: subCount
     });
 
-    showToast((batch.batchName || batch.name) + ' pushed to Filter-Press — supplies deducted (' + duration + ')');
+    showToast(batchName + ' pushed to Tank C \u2014 supplies deducted (' + duration + ')');
 
     // Reset running state
-    state.runningBatch = null;
-    state.runStartTime = null;
-    state.pushing = false;
+    state.createdBatchId   = null;
+    state.createdBatchName = null;
+    state.runStartTime     = null;
+    state.pushing          = false;
 
-    // Reload queue to show next batch
+    // Reload to show fresh RO batches
     return loadBatches();
   }).then(function() {
     renderLog();
   }).catch(function(err) {
     console.error('Push error:', err);
-    state.pushing = false;
-    state.runningBatch = null;
-    state.runStartTime = null;
+    state.pushing          = false;
+    state.createdBatchId   = null;
+    state.createdBatchName = null;
+    state.runStartTime     = null;
     setStatus('error', 'Error pushing batch');
     renderControl();
   });
@@ -1601,16 +1688,17 @@ function handleLogin() {
 }
 
 function handleLogout() {
-  // Stop timer if running
   stopTimer();
 
-  state.currentOperator = null;
-  state.currentCode     = null;
-  state.batches         = [];
-  state.runningBatch    = null;
-  state.runStartTime    = null;
-  state.sessionLogs     = [];
-  state.pushing         = false;
+  state.currentOperator  = null;
+  state.currentCode      = null;
+  state.roBatches        = [];
+  state.createdBatchId   = null;
+  state.createdBatchName = null;
+  state.runStartTime     = null;
+  state.sessionLogs      = [];
+  state.pushing          = false;
+  state.creating         = false;
   showScreen('screen-login');
   document.getElementById('operator-code').focus();
 }
@@ -1645,11 +1733,28 @@ function getInitials(name) {
   return name.split(' ').map(function(p) { return p[0]; }).join('');
 }
 
+function formatBatchTimestamp(date) {
+  var mo  = String(date.getMonth() + 1).padStart(2, '0');
+  var day = String(date.getDate()).padStart(2, '0');
+  var yr  = date.getFullYear();
+  var h   = date.getHours();
+  var m   = date.getMinutes();
+  var ampm = h >= 12 ? 'PM' : 'AM';
+  h = h % 12;
+  if (h === 0) h = 12;
+  return mo + '/' + day + '/' + yr + ' ' + h + ':' + (m < 10 ? '0' : '') + m + ampm;
+}
+
 function formatDateISO(date) {
   var y = date.getFullYear();
   var m = String(date.getMonth() + 1).padStart(2, '0');
   var d = String(date.getDate()).padStart(2, '0');
   return y + '-' + m + '-' + d;
+}
+
+function formatDateShort(d) {
+  var months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return months[d.getMonth()] + ' ' + d.getDate();
 }
 
 function formatTimeInput(date) {
