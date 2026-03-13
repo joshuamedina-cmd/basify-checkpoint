@@ -984,7 +984,7 @@ a, button, input, textarea, select {
   <!-- ===========================
        SCREEN 1: LOGIN
        =========================== -->
-  <div class="screen active" id="screen-login">
+  <div class="screen" id="screen-login" style="display:none!important">
 
     <div class="header">
       <!-- Chemistry flask icon -->
@@ -1032,7 +1032,7 @@ a, button, input, textarea, select {
   <!-- ===========================
        SCREEN 2: MAIN
        =========================== -->
-  <div class="screen" id="screen-main">
+  <div class="screen active" id="screen-main">
 
     <div class="header">
       <div style="display:flex;align-items:center;justify-content:center;gap:var(--space-3);margin-bottom:var(--space-1);">
@@ -1516,15 +1516,7 @@ function handleLogin() {
 }
 
 function logout() {
-  stopTimer();
-  currentOperator = null;
-  activeBatch = null;
-  runStartTime = null;
-  roBatches = [];
-  sessionLogs = [];
-  document.getElementById('screen-main').classList.remove('active');
-  document.getElementById('screen-login').classList.add('active');
-  document.getElementById('operator-code').value = '';
+  window.location.href = "https://kmjz-master-hub.vercel.app";
 }
 
 /* ===========================
@@ -1602,5 +1594,33 @@ document.getElementById('modal-confirm').addEventListener('click', function(e) {
 document.getElementById('operator-code').focus();
 </script>
 
+
+<script>
+// === AUTO-SET OPERATOR FROM LOCALSTORAGE (no code wall) ===
+(function() {
+  var name = null;
+  try { name = localStorage.getItem('kmjz_operator_name'); } catch(e) {}
+  if (name && typeof state !== 'undefined' && state) {
+    state.currentOperator = name;
+    if (typeof state.currentCode !== 'undefined') {
+      try { state.currentCode = localStorage.getItem('kmjz_operator_code') || ''; } catch(e) {}
+    }
+  } else if (name) {
+    if (typeof currentOperator !== 'undefined') {
+      currentOperator = name;
+    }
+    window._autoOperator = name;
+  }
+  // Update operator badge if exists
+  var badge = document.getElementById('operatorName') || document.getElementById('operatorBadge');
+  if (badge && name) badge.textContent = name;
+  // Update any operator display elements
+  document.querySelectorAll('[id*="perator"]').forEach(function(el) {
+    if (el.tagName === 'SPAN' && el.id.toLowerCase().includes('name') && name) {
+      el.textContent = name;
+    }
+  });
+})();
+</script>
 </body>
 </html>
